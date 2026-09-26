@@ -1,0 +1,55 @@
+name: IaC Security Scan (multi-provider)
+
+on:
+  pull_request:
+    paths:
+      - '**.tf'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [alicloud, aws, azure, gcp, oracle]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Create output folder
+        run: mkdir -p results/${{ matrix.provider }}
+
+      - name: Run Checkov on ${{ matrix.provider }}
+        run: |
+          checkov -d terraform/${{ matrix.provider }} \
+            --output json \
+            --output-file-path results/${{ matrix.provider }}/checkov_results.json
+        continue-on-error: true
+
+      - name: Run Trivy on ${{ matrix.provider }}
+        run: |
+          trivy config terraform/${{ matrix.provider }} \
+            --skip-check-update \
+            --include-non-failures \
+            --format json \
+            -o results/${{ matrix.provider }}/trivy_results.json
+        continue-on-error: true
+
+      - name: Upload scan results as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ matrix.provider }}
+          path: results/${{ matrix.provider }}/

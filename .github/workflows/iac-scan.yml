@@ -48,6 +48,13 @@ jobs:
             -o results/${{ matrix.provider }}/trivy_results.json
         continue-on-error: true
 
+      - name: Normalize findings
+        run: |
+          python scripts/normalize.py \
+            --checkov results/${{ matrix.provider }}/checkov_results.json \
+            --trivy results/${{ matrix.provider }}/trivy_results.json \
+            --output results/${{ matrix.provider }}/unified_findings.json
+
       - name: Upload scan results as artifacts
         uses: actions/upload-artifact@v4
         with:

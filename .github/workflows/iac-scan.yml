@@ -34,13 +34,11 @@ jobs:
 
       - name: Run Checkov on ${{ matrix.provider }}
         run: |
-          mkdir -p results/${{ matrix.provider }}
           checkov -d terraform/${{ matrix.provider }} \
             --output json \
-            --output-file-path results/${{ matrix.provider }}
+            --output-file-path results/${{ matrix.provider }} || true
           mv results/${{ matrix.provider }}/results_json.json \
              results/${{ matrix.provider }}/checkov_results.json
-        continue-on-error: true
 
       - name: Run Trivy on ${{ matrix.provider }}
         run: |
@@ -48,8 +46,7 @@ jobs:
             --skip-check-update \
             --include-non-failures \
             --format json \
-            -o results/${{ matrix.provider }}/trivy_results.json
-        continue-on-error: true
+            -o results/${{ matrix.provider }}/trivy_results.json || true
 
       - name: Normalize findings
         run: |

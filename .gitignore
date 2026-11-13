@@ -37,3 +37,6 @@ credentials.json
 .DS_Store
 twistcli
 
+results/
+*.pyc
+__pycache__/

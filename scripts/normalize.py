@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
 """
-normalize.py
-
-Normalise et fusionne les résultats de Checkov et Trivy en un schéma
-commun unique (JSON), avec déduplication basique.
-
+normalize.py — Normalise et fusionne les résultats de KICS et Trivy.
 Usage :
     python scripts/normalize.py \
-        --checkov results/aws/checkov_results.json \
-        --trivy   results/aws/trivy_results.json \
-        --output  results/aws/unified_findings.json
-
-Ce script ne fait AUCUNE hypothèse sur le provider : il traite
-uniquement les deux fichiers JSON qu'on lui donne en argument, ce qui
-permet de le réutiliser tel quel pour aws/azure/gcp/oracle/alicloud
-simplement en changeant les chemins passés en argument (voir le
-workflow GitHub Actions).
+        --kics  results/aws/kics_results.json \
+        --trivy results/aws/trivy_results.json \
+        --provider aws \
+        --output results/aws/unified_findings.json
 """
-
-import argparse
-import json
-import re
-import sys
+import argparse, json, re, sys
 from pathlib import Path
 
 REQUIRED_KEYS = [
@@ -31,18 +18,49 @@ REQUIRED_KEYS = [
 ]
 
 
-def normalize_path(p):
-    """Uniformise les chemins : enlève \\ et / initiaux, uniformise les slashs."""
-    if not p:
+def normalize_path(p, provider=None):
+    """Uniformise les chemins vers terraform/<provider>/<fichier>."""
+    if not p or p.strip() in (".", "./"):
         return ""
-    return re.sub(r"^[\\/]+", "", p).replace("\\", "/")
+
+    p = p.replace("\\", "/")
+    p = re.sub(r"^(\.\./|\./)+", "", p)
+    p = re.sub(r"^/+", "", p)
+    p = re.sub(r"^path/", "", p)
+
+    if provider and p.startswith(f"terraform/{provider}/"):
+        p = p[len(f"terraform/{provider}/"):]
+
+    if provider:
+        return f"terraform/{provider}/{p}" if p else ""
+    return p
 
 
-def parse_trivy(data):
+def infer_check_type(file_path):
+    """Déduit le type à partir du nom du fichier."""
+    if not file_path:
+        return "unknown"
+    fname = Path(file_path).name.lower()
+    if fname == "dockerfile" or fname.startswith("dockerfile."):
+        return "dockerfile"
+    ext = Path(file_path).suffix.lower()
+    return {
+        ".tf": "terraform",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".json": "json",
+        ".dockerfile": "dockerfile",
+    }.get(ext, "unknown")
+
+
+def parse_trivy(data, provider="aws"):
     findings = []
     for result in data.get("Results", []):
         target = result.get("Target", "")
         result_type = (result.get("Type") or "").lower()
+
+        if target.strip() in (".", "./"):
+            continue
 
         for m in result.get("Misconfigurations", []):
             findings.append({
@@ -51,7 +69,7 @@ def parse_trivy(data):
                 "title": m.get("Title"),
                 "severity": (m.get("Severity") or "UNKNOWN").upper(),
                 "status": (m.get("Status") or "FAIL").upper(),
-                "file": normalize_path(target),
+                "file": normalize_path(target, provider),
                 "line": (m.get("CauseMetadata") or {}).get("StartLine"),
                 "resource": m.get("Resource") or (m.get("CauseMetadata") or {}).get("Resource"),
                 "message": m.get("Message") or m.get("Description"),
@@ -63,125 +81,90 @@ def parse_trivy(data):
     return findings
 
 
-def normalize_checkov_block(block):
-    ct = block.get("check_type", "unknown")
-    results = block.get("results", {})
-    out = []
-
-    def build(c, status, refs=None):
-        return {
-            "tool": "checkov",
-            "check_id": c.get("check_id"),
-            "title": c.get("check_name"),
-            "severity": (c.get("severity") or "UNKNOWN").upper(),
-            "status": status,
-            "file": normalize_path(c.get("file_path", "")),
-            "line": (c.get("file_line_range") or [None])[0],
-            "resource": c.get("resource"),
-            "message": c.get("check_name"),
-            "resolution": None,
-            "references": refs or [],
-            "check_type": ct,
-            "raw": c,
-        }
-
-    for c in results.get("passed_checks", []):
-        refs = [c.get("guideline")] if c.get("guideline") else []
-        out.append(build(c, "PASS", refs))
-
-    for c in results.get("failed_checks", []):
-        refs = [c.get("guideline")] if c.get("guideline") else []
-        out.append(build(c, "FAIL", refs))
-
-    for c in results.get("skipped_checks", []):
-        out.append(build(c, "SKIP", []))
-
-    return out
-
-
-def parse_checkov(checkov_raw):
+def parse_kics(data, provider="aws"):
     findings = []
-    blocks = checkov_raw if isinstance(checkov_raw, list) else [checkov_raw]
-    for block in blocks:
-        findings.extend(normalize_checkov_block(block))
+    for q in data.get("queries", []):
+        severity = (q.get("severity") or "UNKNOWN").upper()
+        title = q.get("query_name")
+        desc = q.get("description") or title
+        url = q.get("query_url")
+
+        for f in q.get("files", []):
+            fname = f.get("file_name", "")
+            remediation = f.get("remediation") or None
+
+            findings.append({
+                "tool": "kics",
+                "check_id": q.get("query_id"),
+                "title": title,
+                "severity": severity,
+                "status": "FAIL",
+                "file": normalize_path(fname, provider),
+                "line": f.get("line"),
+                "resource": f.get("resource_name") or f.get("search_key"),
+                "message": desc,
+                "resolution": remediation,
+                "references": [url] if url else [],
+                "check_type": infer_check_type(fname),
+                "raw": {"query": q, "file": f},
+            })
     return findings
 
 
 def dedup_key(f):
-    """
-    Clé de dédup : même outil + check_id + fichier + ligne + status +
-    ressource + type. Le check_id reste spécifique à l'outil, donc deux
-    outils ne se dédupliquent JAMAIS entre eux (voulu : on garde la
-    traçabilité de l'outil source).
-    """
     return (
-        f["tool"],
-        f["check_id"],
-        f["file"],
-        f["line"] or 0,
-        f["status"],
-        f["resource"] or "",
-        f["check_type"],
+        f["tool"], f["check_id"], f["file"], f["line"] or 0,
+        f["status"], f["resource"] or "", f["check_type"],
     )
 
 
-def build_meta(trivy_findings, checkov_findings, all_findings, normalized, sources):
+def build_meta(trivy_findings, kics_findings, all_findings, normalized, sources):
     return {
         "scope": "all",
         "schema_version": "1.0",
         "sources": sources,
         "counts": {
             "trivy": len(trivy_findings),
-            "checkov": len(checkov_findings),
+            "kics": len(kics_findings),
             "before_dedup": len(all_findings),
             "unified": len(normalized),
         },
-        "by_status": {
-            s: sum(1 for f in normalized if f["status"] == s)
-            for s in ["PASS", "FAIL", "SKIP", "IGNORE", "UNKNOWN"]
-        },
-        "by_severity": {
-            s: sum(1 for f in normalized if f["severity"] == s)
-            for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]
-        },
-        "by_tool": {
-            t: sum(1 for f in normalized if f["tool"] == t)
-            for t in ["trivy", "checkov"]
-        },
-        "by_check_type": {
-            ct: sum(1 for f in normalized if f["check_type"] == ct)
-            for ct in sorted({f["check_type"] for f in normalized})
-        } if normalized else {},
-        "by_file": {
-            fp: sum(1 for f in normalized if f["file"] == fp)
-            for fp in sorted({f["file"] for f in normalized})
-        } if normalized else {},
+        "by_status": {s: sum(1 for f in normalized if f["status"] == s)
+                      for s in ["PASS", "FAIL", "SKIP", "IGNORE", "UNKNOWN"]},
+        "by_severity": {s: sum(1 for f in normalized if f["severity"] == s)
+                        for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"]},
+        "by_tool": {t: sum(1 for f in normalized if f["tool"] == t)
+                    for t in ["trivy", "kics"]},
+        "by_check_type": {ct: sum(1 for f in normalized if f["check_type"] == ct)
+                          for ct in sorted({f["check_type"] for f in normalized})} if normalized else {},
+        "by_file": {fp: sum(1 for f in normalized if f["file"] == fp)
+                    for fp in sorted({f["file"] for f in normalized})} if normalized else {},
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Normalise les résultats Checkov + Trivy.")
-    parser.add_argument("--checkov", required=True, type=Path, help="Chemin vers checkov_results.json")
-    parser.add_argument("--trivy", required=True, type=Path, help="Chemin vers trivy_results.json")
-    parser.add_argument("--output", required=True, type=Path, help="Chemin de sortie unified_findings.json")
+    parser = argparse.ArgumentParser(description="Normalise les résultats KICS + Trivy.")
+    parser.add_argument("--kics", required=True, type=Path)
+    parser.add_argument("--trivy", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--provider", default="aws", help="Provider Terraform (aws, azure, gcp, ...)")
     args = parser.parse_args()
 
-    if not args.checkov.exists():
-        print(f"⚠️  Fichier Checkov introuvable : {args.checkov} (on continue avec 0 alerte Checkov)", file=sys.stderr)
-        checkov_raw = []
+    if not args.kics.exists():
+        print(f"⚠️  KICS introuvable : {args.kics}", file=sys.stderr)
+        kics_raw = {"queries": []}
     else:
-        checkov_raw = json.loads(args.checkov.read_text(encoding="utf-8"))
+        kics_raw = json.loads(args.kics.read_text(encoding="utf-8"))
 
     if not args.trivy.exists():
-        print(f"⚠️  Fichier Trivy introuvable : {args.trivy} (on continue avec 0 alerte Trivy)", file=sys.stderr)
+        print(f"⚠️  Trivy introuvable : {args.trivy}", file=sys.stderr)
         trivy_raw = {"Results": []}
     else:
         trivy_raw = json.loads(args.trivy.read_text(encoding="utf-8"))
 
-    trivy_findings = parse_trivy(trivy_raw)
-    checkov_findings = parse_checkov(checkov_raw)
-
-    all_findings = trivy_findings + checkov_findings
+    trivy_findings = parse_trivy(trivy_raw, args.provider)
+    kics_findings = parse_kics(kics_raw, args.provider)
+    all_findings = trivy_findings + kics_findings
 
     seen = {}
     for f in all_findings:
@@ -192,15 +175,14 @@ def main():
 
     normalized = [{k: f.get(k) for k in REQUIRED_KEYS} for f in unified]
 
-    sources = {"trivy": str(args.trivy), "checkov": str(args.checkov)}
-    meta = build_meta(trivy_findings, checkov_findings, all_findings, normalized, sources)
+    sources = {"trivy": str(args.trivy), "kics": str(args.kics), "provider": args.provider}
+    meta = build_meta(trivy_findings, kics_findings, all_findings, normalized, sources)
 
     output = {"meta": meta, "findings": normalized}
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # Résumé sur stdout, utile dans les logs GitHub Actions
     print("=" * 60)
     print(f"Normalisation terminée → {args.output}")
     print("=" * 60)

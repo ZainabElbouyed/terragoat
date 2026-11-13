@@ -22,8 +22,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Checkov
-        run: pip install checkov
+      - name: Pull KICS Docker Image
+        run: docker pull checkmarx/kics:latest
 
       - name: Install Trivy
         run: |
@@ -32,13 +32,17 @@ jobs:
       - name: Create output folder
         run: mkdir -p results/${{ matrix.provider }}
 
-      - name: Run Checkov on ${{ matrix.provider }}
+      - name: Run KICS on ${{ matrix.provider }}
         run: |
-          checkov -d terraform/${{ matrix.provider }} \
-            --output json \
-            --output-file-path results/${{ matrix.provider }} || true
-          mv results/${{ matrix.provider }}/results_json.json \
-             results/${{ matrix.provider }}/checkov_results.json
+          docker run --rm -t \
+            -v "${{ github.workspace }}:/path" \
+            checkmarx/kics:latest scan \
+              -p /path/terraform/${{ matrix.provider }} \
+              -o /path/results/${{ matrix.provider }} \
+              --report-formats json \
+              --output-name kics_results \
+              --no-progress \
+            || true
 
       - name: Run Trivy on ${{ matrix.provider }}
         run: |
@@ -51,8 +55,9 @@ jobs:
       - name: Normalize findings
         run: |
           python scripts/normalize.py \
-            --checkov results/${{ matrix.provider }}/checkov_results.json \
+            --kics  results/${{ matrix.provider }}/kics_results.json \
             --trivy results/${{ matrix.provider }}/trivy_results.json \
+            --provider ${{ matrix.provider }} \
             --output results/${{ matrix.provider }}/unified_findings.json
 
       - name: Upload scan results as artifacts

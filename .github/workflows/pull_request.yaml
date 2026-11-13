@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run KICS Scan
-        uses: checkmarx/kics-github-action@v1.7.0
+        uses: checkmarx/kics-github-action@v2.1.20
         with:
           path: 'terraform'
           output_path: 'kicsResults/'

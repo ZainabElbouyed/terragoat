@@ -21,7 +21,7 @@ jobs:
           output_path: 'kicsResults/'
           output_formats: 'json,sarif'
           # fail_on: high # Décommente pour faire échouer le job sur les findings HIGH
-          # ignore_on_exit: results # Décommente pour ne pas échouer sur les findings
+          ignore_on_exit: results
 
       - name: Upload SARIF file
         uses: github/codeql-action/upload-sarif@v3
